@@ -1,0 +1,13 @@
+node_modules/
+.next/
+out/
+.env
+.env.local
+.env.production
+*.tsbuildinfo
+next-env.d.ts
+
+# Python legacy
+__pycache__/
+*.pyc
+venv/
