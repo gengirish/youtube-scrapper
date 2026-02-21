@@ -1,15 +1,18 @@
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
 
-const CONSENT_COOKIE =
-  "CONSENT=PENDING+999; SOCS=CAESEwgDEgk2NjU1NjU2NTcaAmVuIAEaBgiA_LyuBg";
+const INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+const INNERTUBE_BASE_URL = "https://www.youtube.com/youtubei/v1";
 
-interface CaptionTrack {
-  baseUrl: string;
-  languageCode: string;
-  name: { simpleText: string };
-  kind?: string;
-}
+const INNERTUBE_CONTEXT = {
+  client: {
+    hl: "en",
+    gl: "US",
+    clientName: "WEB",
+    clientVersion: "2.20250219.01.00",
+    userAgent: USER_AGENT,
+  },
+};
 
 export interface TranscriptSegment {
   text: string;
@@ -46,66 +49,73 @@ function decodeHtmlEntities(text: string): string {
     .trim();
 }
 
-function extractPlayerResponse(html: string): Record<string, unknown> {
-  const marker = "ytInitialPlayerResponse";
-  const startIdx = html.indexOf(marker);
-  if (startIdx === -1) {
-    throw new TranscriptError(
-      "Could not find player response in page. The video may be unavailable.",
-      404,
-    );
-  }
-
-  const assignIdx = html.indexOf("=", startIdx);
-  const jsonStart = html.indexOf("{", assignIdx);
-  if (jsonStart === -1) {
-    throw new TranscriptError("Failed to parse YouTube page.", 500);
-  }
-
-  let depth = 0;
-  let jsonEnd = jsonStart;
-  for (let i = jsonStart; i < html.length; i++) {
-    if (html[i] === "{") depth++;
-    else if (html[i] === "}") depth--;
-    if (depth === 0) {
-      jsonEnd = i + 1;
-      break;
-    }
-  }
-
-  const jsonStr = html.substring(jsonStart, jsonEnd);
-  try {
-    return JSON.parse(jsonStr);
-  } catch {
-    throw new TranscriptError("Failed to parse player response JSON.", 500);
-  }
+interface CaptionTrack {
+  baseUrl: string;
+  languageCode: string;
+  name: { simpleText?: string; runs?: Array<{ text: string }> };
+  kind?: string;
 }
 
-function getCaptionTracks(
-  playerResponse: Record<string, unknown>,
-): CaptionTrack[] {
-  const captions = playerResponse?.captions as Record<string, unknown>;
-  if (!captions) {
+function getTrackName(track: CaptionTrack): string {
+  if (track.name?.simpleText) return track.name.simpleText;
+  if (track.name?.runs) return track.name.runs.map((r) => r.text).join("");
+  return track.languageCode;
+}
+
+async function getPlayerCaptions(
+  videoId: string,
+): Promise<{ tracks: CaptionTrack[]; playabilityStatus: string }> {
+  const url = `${INNERTUBE_BASE_URL}/player?key=${INNERTUBE_API_KEY}`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": USER_AGENT,
+    },
+    body: JSON.stringify({
+      context: INNERTUBE_CONTEXT,
+      videoId,
+    }),
+  });
+
+  if (!response.ok) {
     throw new TranscriptError(
-      "No captions available for this video. The video may not have subtitles enabled.",
+      `YouTube API returned HTTP ${response.status}.`,
+      502,
+    );
+  }
+
+  const data = (await response.json()) as {
+    playabilityStatus?: { status?: string; reason?: string };
+    captions?: {
+      playerCaptionsTracklistRenderer?: {
+        captionTracks?: CaptionTrack[];
+      };
+    };
+  };
+
+  const status = data.playabilityStatus?.status || "UNKNOWN";
+
+  if (status === "ERROR" || status === "UNPLAYABLE") {
+    throw new TranscriptError(
+      data.playabilityStatus?.reason ||
+        "This video is unavailable or has been removed.",
       404,
     );
   }
 
-  const renderer = captions?.playerCaptionsTracklistRenderer as Record<
-    string,
-    unknown
-  >;
-  const tracks = renderer?.captionTracks as CaptionTrack[];
-
-  if (!tracks || tracks.length === 0) {
+  if (status === "LOGIN_REQUIRED") {
     throw new TranscriptError(
-      "No caption tracks found for this video.",
-      404,
+      "This video requires login (age-restricted or private).",
+      403,
     );
   }
 
-  return tracks;
+  const tracks =
+    data.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+
+  return { tracks, playabilityStatus: status };
 }
 
 export async function fetchYouTubeTranscript(
@@ -115,73 +125,44 @@ export async function fetchYouTubeTranscript(
   segments: TranscriptSegment[];
   languages: AvailableLanguage[];
 }> {
-  // Step 1: Fetch the video page with consent cookies
-  const pageUrl = `https://www.youtube.com/watch?v=${videoId}&hl=en`;
-  const pageResponse = await fetch(pageUrl, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      "Accept-Language": "en-US,en;q=0.9",
-      Cookie: CONSENT_COOKIE,
-    },
-  });
+  // Step 1: Get caption tracks via InnerTube API
+  const { tracks } = await getPlayerCaptions(videoId);
 
-  if (!pageResponse.ok) {
+  if (tracks.length === 0) {
     throw new TranscriptError(
-      `Failed to fetch YouTube page (HTTP ${pageResponse.status}).`,
-      pageResponse.status >= 500 ? 502 : 404,
-    );
-  }
-
-  const html = await pageResponse.text();
-
-  // Check for unavailable video
-  if (
-    html.includes('"playabilityStatus":{"status":"ERROR"') ||
-    html.includes('"playabilityStatus":{"status":"UNPLAYABLE"')
-  ) {
-    throw new TranscriptError(
-      "This video is unavailable or has been removed.",
+      "No captions available for this video. The video may not have subtitles enabled.",
       404,
     );
   }
 
-  // Step 2: Extract player response
-  const playerResponse = extractPlayerResponse(html);
-
-  // Step 3: Get caption tracks
-  const captionTracks = getCaptionTracks(playerResponse);
-
-  const languages: AvailableLanguage[] = captionTracks.map((track) => ({
+  const languages: AvailableLanguage[] = tracks.map((track) => ({
     code: track.languageCode,
-    name: track.name?.simpleText || track.languageCode,
+    name: getTrackName(track),
     is_generated: track.kind === "asr",
   }));
 
-  // Step 4: Select the right track
+  // Step 2: Select the right track
   let selectedTrack: CaptionTrack;
   if (language) {
-    const found = captionTracks.find((t) => t.languageCode === language);
+    const found = tracks.find((t) => t.languageCode === language);
     if (!found) {
       const available = languages.map((l) => l.code).join(", ");
       throw new TranscriptError(
-        `Transcript not available in "${language}". Available languages: ${available}`,
+        `Transcript not available in "${language}". Available: ${available}`,
         404,
       );
     }
     selectedTrack = found;
   } else {
-    selectedTrack = captionTracks[0];
+    selectedTrack = tracks[0];
   }
 
-  // Step 5: Fetch transcript in JSON3 format
+  // Step 3: Fetch transcript in JSON3 format
   const separator = selectedTrack.baseUrl.includes("?") ? "&" : "?";
   const transcriptUrl = `${selectedTrack.baseUrl}${separator}fmt=json3`;
 
   const transcriptResponse = await fetch(transcriptUrl, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      Cookie: CONSENT_COOKIE,
-    },
+    headers: { "User-Agent": USER_AGENT },
   });
 
   if (!transcriptResponse.ok) {
@@ -199,7 +180,7 @@ export async function fetchYouTubeTranscript(
     }>;
   };
 
-  // Step 6: Parse events into segments
+  // Step 4: Parse events into segments
   const events = transcriptData?.events || [];
   const segments: TranscriptSegment[] = [];
 
