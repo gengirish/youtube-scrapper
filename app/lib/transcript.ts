@@ -1,7 +1,17 @@
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
 
-const CONSENT_COOKIE = "CONSENT=YES+cb.20210328-17-p0.en+FX+688";
+const PIPED_INSTANCES = [
+  "https://pipedapi.kavin.rocks",
+  "https://pipedapi.adminforge.de",
+  "https://api.piped.yt",
+];
+
+const INVIDIOUS_INSTANCES = [
+  "https://inv.nadeko.net",
+  "https://invidious.nerdvpn.de",
+  "https://invidious.jing.rocks",
+];
 
 export interface TranscriptSegment {
   text: string;
@@ -34,9 +44,10 @@ function decodeHtmlEntities(text: string): string {
     .replace(/&#39;/g, "'")
     .replace(/&#x27;/g, "'")
     .replace(/&#x2F;/g, "/")
-    .replace(/\n/g, " ")
     .trim();
 }
+
+// --- Strategy 1: Direct YouTube (works from non-cloud IPs) ---
 
 interface CaptionTrack {
   baseUrl: string;
@@ -51,221 +62,196 @@ function getTrackName(track: CaptionTrack): string {
   return track.languageCode;
 }
 
-async function fetchVideoPage(videoId: string): Promise<string> {
-  const url = `https://www.youtube.com/watch?v=${videoId}&bpctr=9999999999&has_verified=1`;
-
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      "Accept-Language": "en-US,en;q=0.9",
-      Accept:
-        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      Cookie: CONSENT_COOKIE,
-    },
-  });
-
-  if (!response.ok) {
-    throw new TranscriptError(
-      `Failed to fetch YouTube page (HTTP ${response.status}).`,
-      502,
-    );
-  }
-
-  return response.text();
-}
-
-function extractJsonFromHtml(
-  html: string,
-  marker: string,
-): Record<string, unknown> | null {
-  const idx = html.indexOf(marker);
-  if (idx === -1) return null;
-
-  const assignIdx = html.indexOf("=", idx + marker.length);
-  if (assignIdx === -1) return null;
-
-  const jsonStart = html.indexOf("{", assignIdx);
-  if (jsonStart === -1) return null;
-
-  let depth = 0;
-  for (let i = jsonStart; i < html.length; i++) {
-    if (html[i] === "{") depth++;
-    else if (html[i] === "}") depth--;
-    if (depth === 0) {
-      try {
-        return JSON.parse(html.substring(jsonStart, i + 1));
-      } catch {
-        return null;
-      }
-    }
-  }
-
-  return null;
-}
-
-function extractSessionData(html: string): {
-  apiKey: string | null;
-  visitorData: string | null;
-} {
-  const apiKeyMatch = html.match(/"INNERTUBE_API_KEY":"([^"]+)"/);
-  const visitorMatch = html.match(/"visitorData":"([^"]+)"/);
-
-  return {
-    apiKey: apiKeyMatch?.[1] ?? null,
-    visitorData: visitorMatch?.[1] ?? null,
-  };
-}
-
-async function getCaptionsViaInnerTube(
-  videoId: string,
-  apiKey: string,
-  visitorData: string | null,
-): Promise<CaptionTrack[]> {
-  const url = `https://www.youtube.com/youtubei/v1/player?key=${apiKey}`;
-
-  const context: Record<string, unknown> = {
-    client: {
-      hl: "en",
-      gl: "US",
-      clientName: "WEB",
-      clientVersion: "2.20250219.01.00",
-      userAgent: USER_AGENT,
-      ...(visitorData ? { visitorData } : {}),
-    },
-  };
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": USER_AGENT,
-      Origin: "https://www.youtube.com",
-      Referer: `https://www.youtube.com/watch?v=${videoId}`,
-      Cookie: CONSENT_COOKIE,
-      ...(visitorData ? { "X-Goog-Visitor-Id": visitorData } : {}),
-    },
-    body: JSON.stringify({ context, videoId }),
-  });
-
-  if (!response.ok) return [];
-
-  const data = (await response.json()) as {
-    playabilityStatus?: { status?: string };
-    captions?: {
-      playerCaptionsTracklistRenderer?: { captionTracks?: CaptionTrack[] };
-    };
-  };
-
-  return (
-    data.captions?.playerCaptionsTracklistRenderer?.captionTracks || []
-  );
-}
-
-export async function fetchYouTubeTranscript(
+async function tryDirectYouTube(
   videoId: string,
   language?: string,
 ): Promise<{
   segments: TranscriptSegment[];
   languages: AvailableLanguage[];
-}> {
-  // Step 1: Fetch video page
-  const html = await fetchVideoPage(videoId);
+} | null> {
+  try {
+    const url = `https://www.youtube.com/watch?v=${videoId}&bpctr=9999999999&has_verified=1`;
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "en-US,en;q=0.9",
+        Cookie: "CONSENT=YES+cb.20210328-17-p0.en+FX+688",
+      },
+    });
 
-  // Check for unavailable video
-  if (html.includes('"playabilityStatus":{"status":"ERROR"')) {
-    throw new TranscriptError(
-      "This video is unavailable or has been removed.",
-      404,
-    );
+    if (!response.ok) return null;
+    const html = await response.text();
+
+    if (html.includes('"status":"LOGIN_REQUIRED"')) return null;
+
+    const captionsMatch = html.match(/"captionTracks":(\[.*?\])/);
+    if (!captionsMatch) return null;
+
+    const tracks: CaptionTrack[] = JSON.parse(captionsMatch[1]);
+    if (tracks.length === 0) return null;
+
+    const languages = tracks.map((t) => ({
+      code: t.languageCode,
+      name: getTrackName(t),
+      is_generated: t.kind === "asr",
+    }));
+
+    const selected = language
+      ? tracks.find((t) => t.languageCode === language) || tracks[0]
+      : tracks[0];
+
+    const sep = selected.baseUrl.includes("?") ? "&" : "?";
+    const transcriptRes = await fetch(`${selected.baseUrl}${sep}fmt=json3`, {
+      headers: { "User-Agent": USER_AGENT },
+    });
+
+    if (!transcriptRes.ok) return null;
+    return { segments: parseJson3(await transcriptRes.json()), languages };
+  } catch {
+    return null;
   }
+}
 
-  // Step 2: Try extracting captions from ytInitialPlayerResponse in page
-  let tracks: CaptionTrack[] = [];
+// --- Strategy 2: Piped API ---
 
-  const playerResponse = extractJsonFromHtml(
-    html,
-    "ytInitialPlayerResponse",
-  );
-  if (playerResponse) {
-    const captions = playerResponse.captions as Record<string, unknown>;
-    const renderer = captions?.playerCaptionsTracklistRenderer as Record<
-      string,
-      unknown
-    >;
-    tracks = (renderer?.captionTracks as CaptionTrack[]) || [];
-  }
+interface PipedSubtitle {
+  url: string;
+  mimeType: string;
+  name: string;
+  code: string;
+  autoGenerated: boolean;
+}
 
-  // Step 3: If page didn't have captions, try InnerTube API with session data
-  if (tracks.length === 0) {
-    const { apiKey, visitorData } = extractSessionData(html);
-    if (apiKey) {
-      tracks = await getCaptionsViaInnerTube(videoId, apiKey, visitorData);
+async function tryPiped(
+  videoId: string,
+  language?: string,
+): Promise<{
+  segments: TranscriptSegment[];
+  languages: AvailableLanguage[];
+} | null> {
+  for (const instance of PIPED_INSTANCES) {
+    try {
+      const res = await fetch(`${instance}/streams/${videoId}`, {
+        headers: { "User-Agent": USER_AGENT },
+        signal: AbortSignal.timeout(10000),
+      });
+
+      if (!res.ok) continue;
+
+      const data = (await res.json()) as {
+        subtitles?: PipedSubtitle[];
+        title?: string;
+      };
+
+      const subs = data.subtitles;
+      if (!subs || subs.length === 0) continue;
+
+      const languages = subs.map((s) => ({
+        code: s.code,
+        name: s.name,
+        is_generated: s.autoGenerated,
+      }));
+
+      const selected = language
+        ? subs.find((s) => s.code === language) || subs[0]
+        : subs[0];
+
+      const subRes = await fetch(selected.url, {
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!subRes.ok) continue;
+
+      const vttText = await subRes.text();
+      const segments = parseVTT(vttText);
+      if (segments.length > 0) return { segments, languages };
+    } catch {
+      continue;
     }
   }
+  return null;
+}
 
-  if (tracks.length === 0) {
-    throw new TranscriptError(
-      "No captions available for this video. The video may not have subtitles enabled.",
-      404,
-    );
-  }
+// --- Strategy 3: Invidious API ---
 
-  const languages: AvailableLanguage[] = tracks.map((track) => ({
-    code: track.languageCode,
-    name: getTrackName(track),
-    is_generated: track.kind === "asr",
-  }));
+interface InvidiousCaption {
+  label: string;
+  languageCode: string;
+  url: string;
+}
 
-  // Step 4: Select the right track
-  let selectedTrack: CaptionTrack;
-  if (language) {
-    const found = tracks.find((t) => t.languageCode === language);
-    if (!found) {
-      const available = languages.map((l) => l.code).join(", ");
-      throw new TranscriptError(
-        `Transcript not available in "${language}". Available: ${available}`,
-        404,
+async function tryInvidious(
+  videoId: string,
+  language?: string,
+): Promise<{
+  segments: TranscriptSegment[];
+  languages: AvailableLanguage[];
+} | null> {
+  for (const instance of INVIDIOUS_INSTANCES) {
+    try {
+      const res = await fetch(
+        `${instance}/api/v1/captions/${videoId}`,
+        {
+          headers: { "User-Agent": USER_AGENT },
+          signal: AbortSignal.timeout(10000),
+        },
       );
+
+      if (!res.ok) continue;
+
+      const data = (await res.json()) as {
+        captions?: InvidiousCaption[];
+      };
+
+      const captions = data.captions;
+      if (!captions || captions.length === 0) continue;
+
+      const languages = captions.map((c) => ({
+        code: c.languageCode,
+        name: c.label,
+        is_generated: c.label.toLowerCase().includes("auto"),
+      }));
+
+      const selected = language
+        ? captions.find((c) => c.languageCode === language) || captions[0]
+        : captions[0];
+
+      const captionUrl = selected.url.startsWith("http")
+        ? selected.url
+        : `${instance}${selected.url}`;
+
+      const subRes = await fetch(captionUrl, {
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!subRes.ok) continue;
+
+      const vttText = await subRes.text();
+      const segments = parseVTT(vttText);
+      if (segments.length > 0) return { segments, languages };
+    } catch {
+      continue;
     }
-    selectedTrack = found;
-  } else {
-    selectedTrack = tracks[0];
   }
+  return null;
+}
 
-  // Step 5: Fetch transcript in JSON3 format
-  const separator = selectedTrack.baseUrl.includes("?") ? "&" : "?";
-  const transcriptUrl = `${selectedTrack.baseUrl}${separator}fmt=json3`;
+// --- Parsers ---
 
-  const transcriptResponse = await fetch(transcriptUrl, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      Cookie: CONSENT_COOKIE,
-    },
-  });
-
-  if (!transcriptResponse.ok) {
-    throw new TranscriptError(
-      "Failed to fetch transcript data from YouTube.",
-      502,
-    );
-  }
-
-  const transcriptData = (await transcriptResponse.json()) as {
+function parseJson3(
+  data: {
     events?: Array<{
       tStartMs?: number;
       dDurationMs?: number;
       segs?: Array<{ utf8: string }>;
     }>;
-  };
-
-  // Step 6: Parse events into segments
-  const events = transcriptData?.events || [];
+  },
+): TranscriptSegment[] {
+  const events = data?.events || [];
   const segments: TranscriptSegment[] = [];
 
   for (const event of events) {
     if (event.segs) {
       const rawText = event.segs.map((s) => s.utf8 || "").join("");
-      const text = decodeHtmlEntities(rawText);
+      const text = decodeHtmlEntities(rawText).replace(/\n/g, " ").trim();
       if (text) {
         segments.push({
           text,
@@ -276,12 +262,87 @@ export async function fetchYouTubeTranscript(
     }
   }
 
-  if (segments.length === 0) {
-    throw new TranscriptError(
-      "Transcript data was empty for this video.",
-      404,
+  return segments;
+}
+
+function parseVTT(vttContent: string): TranscriptSegment[] {
+  const segments: TranscriptSegment[] = [];
+  const blocks = vttContent.split(/\n\n+/);
+
+  for (const block of blocks) {
+    const lines = block.trim().split("\n");
+    const timeLine = lines.find((l) => l.includes("-->"));
+    if (!timeLine) continue;
+
+    const [startStr, endStr] = timeLine.split("-->").map((s) => s.trim());
+    const start = parseVTTTime(startStr);
+    const end = parseVTTTime(endStr);
+
+    const textLines = lines.slice(lines.indexOf(timeLine) + 1);
+    const text = decodeHtmlEntities(
+      textLines
+        .join(" ")
+        .replace(/<[^>]+>/g, "")
+        .trim(),
+    );
+
+    if (text && start !== null && end !== null) {
+      segments.push({
+        text,
+        offset: start,
+        duration: Math.max(0, end - start),
+      });
+    }
+  }
+
+  return segments;
+}
+
+function parseVTTTime(timeStr: string): number | null {
+  const clean = timeStr.replace(/[^\d:.]/g, "");
+  const parts = clean.split(":");
+  if (parts.length < 2) return null;
+
+  if (parts.length === 3) {
+    const [h, m, s] = parts;
+    return (
+      parseInt(h) * 3600 + parseInt(m) * 60 + parseFloat(s)
     );
   }
 
-  return { segments, languages };
+  const [m, s] = parts;
+  return parseInt(m) * 60 + parseFloat(s);
+}
+
+// --- Main fetch function (tries all strategies) ---
+
+export async function fetchYouTubeTranscript(
+  videoId: string,
+  language?: string,
+): Promise<{
+  segments: TranscriptSegment[];
+  languages: AvailableLanguage[];
+}> {
+  // Strategy 1: Direct YouTube (fastest, works from non-cloud IPs)
+  const directResult = await tryDirectYouTube(videoId, language);
+  if (directResult && directResult.segments.length > 0) {
+    return directResult;
+  }
+
+  // Strategy 2: Piped API (open-source YouTube proxy)
+  const pipedResult = await tryPiped(videoId, language);
+  if (pipedResult && pipedResult.segments.length > 0) {
+    return pipedResult;
+  }
+
+  // Strategy 3: Invidious API (another open-source proxy)
+  const invidiousResult = await tryInvidious(videoId, language);
+  if (invidiousResult && invidiousResult.segments.length > 0) {
+    return invidiousResult;
+  }
+
+  throw new TranscriptError(
+    "Could not fetch transcript. YouTube may be blocking cloud requests, or the video may not have captions enabled.",
+    404,
+  );
 }
