@@ -1,18 +1,45 @@
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
 
-const INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 const INNERTUBE_BASE_URL = "https://www.youtube.com/youtubei/v1";
 
-const INNERTUBE_CONTEXT = {
-  client: {
-    hl: "en",
-    gl: "US",
-    clientName: "WEB",
-    clientVersion: "2.20250219.01.00",
-    userAgent: USER_AGENT,
+const CLIENT_CONFIGS = [
+  {
+    name: "WEB_EMBEDDED",
+    context: {
+      client: {
+        hl: "en",
+        gl: "US",
+        clientName: "WEB_EMBEDDED_PLAYER",
+        clientVersion: "1.20250219.01.00",
+      },
+      thirdParty: { embedUrl: "https://www.youtube.com/" },
+    },
   },
-};
+  {
+    name: "TV_EMBEDDED",
+    context: {
+      client: {
+        hl: "en",
+        gl: "US",
+        clientName: "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+        clientVersion: "2.0",
+      },
+      thirdParty: { embedUrl: "https://www.youtube.com/" },
+    },
+  },
+  {
+    name: "WEB",
+    context: {
+      client: {
+        hl: "en",
+        gl: "US",
+        clientName: "WEB",
+        clientVersion: "2.20250219.01.00",
+      },
+    },
+  },
+];
 
 export interface TranscriptSegment {
   text: string;
@@ -62,60 +89,90 @@ function getTrackName(track: CaptionTrack): string {
   return track.languageCode;
 }
 
-async function getPlayerCaptions(
-  videoId: string,
-): Promise<{ tracks: CaptionTrack[]; playabilityStatus: string }> {
-  const url = `${INNERTUBE_BASE_URL}/player?key=${INNERTUBE_API_KEY}`;
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": USER_AGENT,
-    },
-    body: JSON.stringify({
-      context: INNERTUBE_CONTEXT,
-      videoId,
-    }),
-  });
-
-  if (!response.ok) {
-    throw new TranscriptError(
-      `YouTube API returned HTTP ${response.status}.`,
-      502,
-    );
-  }
-
-  const data = (await response.json()) as {
-    playabilityStatus?: { status?: string; reason?: string };
-    captions?: {
-      playerCaptionsTracklistRenderer?: {
-        captionTracks?: CaptionTrack[];
-      };
+interface PlayerApiResponse {
+  playabilityStatus?: { status?: string; reason?: string };
+  captions?: {
+    playerCaptionsTracklistRenderer?: {
+      captionTracks?: CaptionTrack[];
     };
   };
+}
 
-  const status = data.playabilityStatus?.status || "UNKNOWN";
+async function tryPlayerRequest(
+  videoId: string,
+  clientConfig: (typeof CLIENT_CONFIGS)[number],
+): Promise<PlayerApiResponse | null> {
+  try {
+    const response = await fetch(`${INNERTUBE_BASE_URL}/player`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+        Origin: "https://www.youtube.com",
+        Referer: "https://www.youtube.com/",
+      },
+      body: JSON.stringify({
+        context: clientConfig.context,
+        videoId,
+      }),
+    });
 
-  if (status === "ERROR" || status === "UNPLAYABLE") {
-    throw new TranscriptError(
-      data.playabilityStatus?.reason ||
-        "This video is unavailable or has been removed.",
-      404,
-    );
+    if (!response.ok) return null;
+    return (await response.json()) as PlayerApiResponse;
+  } catch {
+    return null;
+  }
+}
+
+async function getPlayerCaptions(
+  videoId: string,
+): Promise<{ tracks: CaptionTrack[] }> {
+  let lastStatus = "UNKNOWN";
+  let lastReason = "";
+
+  for (const clientConfig of CLIENT_CONFIGS) {
+    const data = await tryPlayerRequest(videoId, clientConfig);
+    if (!data) continue;
+
+    const status = data.playabilityStatus?.status || "UNKNOWN";
+
+    if (status === "ERROR" || status === "UNPLAYABLE") {
+      throw new TranscriptError(
+        data.playabilityStatus?.reason ||
+          "This video is unavailable or has been removed.",
+        404,
+      );
+    }
+
+    lastStatus = status;
+    lastReason = data.playabilityStatus?.reason || "";
+
+    const tracks =
+      data.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+
+    if (tracks.length > 0) {
+      return { tracks };
+    }
+
+    if (status === "OK" && tracks.length === 0) {
+      throw new TranscriptError(
+        "No captions available for this video. The video may not have subtitles enabled.",
+        404,
+      );
+    }
   }
 
-  if (status === "LOGIN_REQUIRED") {
+  if (lastStatus === "LOGIN_REQUIRED") {
     throw new TranscriptError(
-      "This video requires login (age-restricted or private).",
+      lastReason || "YouTube requires authentication for this request. Please try again.",
       403,
     );
   }
 
-  const tracks =
-    data.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
-
-  return { tracks, playabilityStatus: status };
+  throw new TranscriptError(
+    "Could not retrieve captions from YouTube. All client strategies exhausted.",
+    502,
+  );
 }
 
 export async function fetchYouTubeTranscript(
