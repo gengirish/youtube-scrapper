@@ -1,17 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import {
-  fetchTranscript,
-  YoutubeTranscriptVideoUnavailableError,
-  YoutubeTranscriptDisabledError,
-  YoutubeTranscriptNotAvailableError,
-  YoutubeTranscriptNotAvailableLanguageError,
-  YoutubeTranscriptTooManyRequestError,
-  YoutubeTranscriptInvalidVideoIdError,
-} from "youtube-transcript-plus";
 import { extractVideoId, formatTime } from "@/app/lib/youtube";
-
-const USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
+import {
+  fetchYouTubeTranscript,
+  TranscriptError,
+} from "@/app/lib/transcript";
 
 async function handleTranscript(url: string, language?: string) {
   const videoId = extractVideoId(url);
@@ -23,19 +15,10 @@ async function handleTranscript(url: string, language?: string) {
   }
 
   try {
-    const config: { lang?: string; userAgent?: string } = {
-      userAgent: USER_AGENT,
-    };
-    if (language) config.lang = language;
-
-    const segments = await fetchTranscript(videoId, config);
-
-    if (!segments || segments.length === 0) {
-      return NextResponse.json(
-        { error: "No transcript segments found for this video." },
-        { status: 404 },
-      );
-    }
+    const { segments, languages } = await fetchYouTubeTranscript(
+      videoId,
+      language,
+    );
 
     const mapped = segments.map((s) => ({
       text: s.text,
@@ -50,54 +33,23 @@ async function handleTranscript(url: string, language?: string) {
 
     return NextResponse.json({
       video_id: videoId,
+      languages,
       segments: mapped,
       plain_text: plainText,
       timestamped_text: timestampedText,
     });
   } catch (error: unknown) {
-    if (error instanceof YoutubeTranscriptVideoUnavailableError) {
+    if (error instanceof TranscriptError) {
       return NextResponse.json(
-        { error: "This video is unavailable or has been removed." },
-        { status: 404 },
-      );
-    }
-    if (error instanceof YoutubeTranscriptDisabledError) {
-      return NextResponse.json(
-        { error: "Transcripts are disabled for this video." },
-        { status: 404 },
-      );
-    }
-    if (error instanceof YoutubeTranscriptNotAvailableError) {
-      return NextResponse.json(
-        { error: "No transcript is available for this video." },
-        { status: 404 },
-      );
-    }
-    if (error instanceof YoutubeTranscriptNotAvailableLanguageError) {
-      return NextResponse.json(
-        {
-          error:
-            error.message ||
-            "Transcript not available in the requested language.",
-        },
-        { status: 404 },
-      );
-    }
-    if (error instanceof YoutubeTranscriptTooManyRequestError) {
-      return NextResponse.json(
-        { error: "Rate limited by YouTube. Please try again later." },
-        { status: 429 },
-      );
-    }
-    if (error instanceof YoutubeTranscriptInvalidVideoIdError) {
-      return NextResponse.json(
-        { error: "Invalid video ID or URL format." },
-        { status: 400 },
+        { error: error.message },
+        { status: error.statusCode },
       );
     }
 
     const message =
-      error instanceof Error ? error.message : "An unexpected error occurred.";
+      error instanceof Error
+        ? error.message
+        : "An unexpected error occurred.";
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
