@@ -10,6 +10,9 @@ import {
 } from "youtube-transcript-plus";
 import { extractVideoId, formatTime } from "@/app/lib/youtube";
 
+const USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
+
 async function handleTranscript(url: string, language?: string) {
   const videoId = extractVideoId(url);
   if (!videoId) {
@@ -20,7 +23,9 @@ async function handleTranscript(url: string, language?: string) {
   }
 
   try {
-    const config: { lang?: string } = {};
+    const config: { lang?: string; userAgent?: string } = {
+      userAgent: USER_AGENT,
+    };
     if (language) config.lang = language;
 
     const segments = await fetchTranscript(videoId, config);
